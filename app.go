@@ -83,6 +83,15 @@ func (app *App) Init() {
 			lastStatus := app.state.status
 			app.state.status = app.pad.LastStatus
 
+			// sync external changes
+			tempoDiff := app.state.status.Speed - lastStatus.Speed
+			if !app.state.started && tempoDiff > 0 {
+				app.state.started = true
+			}
+			if app.state.started && tempoDiff < 0 && app.state.status.Speed == 0 {
+				app.state.started = false
+			}
+
 			// increment difference to accumulate until stopped
 			if app.state.started {
 				timeDiff := app.state.status.Time - lastStatus.Time
@@ -93,15 +102,6 @@ func (app *App) Init() {
 					app.state.stepsAccum += stepsDiff
 					app.state.kmAccum += kmDiff
 				}
-			}
-
-			// sync external changes
-			tempoDiff := app.state.status.Speed - lastStatus.Speed
-			if !app.state.started && tempoDiff > 0 {
-				app.state.started = true
-			}
-			if app.state.started && tempoDiff < 0 && app.state.status.Speed == 0 {
-				app.state.started = false
 			}
 		} else {
 			app.state.started = false
