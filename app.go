@@ -1,9 +1,17 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/getlantern/systray"
@@ -30,9 +38,11 @@ type speedItem struct {
 }
 
 type App struct {
-	Adapter         *bluetooth.Adapter
-	PreferredDevice string
-	TargetSpeed     float64
+	Adapter          *bluetooth.Adapter
+	PreferredDevice  string
+	TargetSpeed      float64
+	WebhookURL       *string
+	WebhookThreshold time.Duration
 
 	pad   *WalkingPad
 	state state
@@ -47,9 +57,11 @@ type state struct {
 	started   bool
 	status    WalkingPadStatus
 
-	timeAccum  time.Duration
-	stepsAccum int
-	kmAccum    float64
+	startedAt time.Time
+
+	timeAccum, timeAccumTotal   time.Duration
+	stepsAccum, stepsAccumTotal int
+	kmAccum, kmAccumTotal       float64
 }
 
 func (app *App) Init() {
@@ -86,10 +98,10 @@ func (app *App) Init() {
 			// sync external changes
 			tempoDiff := app.state.status.Speed - lastStatus.Speed
 			if !app.state.started && tempoDiff > 0 {
-				app.state.started = true
+				app.onBeltStart()
 			}
 			if app.state.started && tempoDiff < 0 && app.state.status.Speed == 0 {
-				app.state.started = false
+				app.onBeltStop()
 			}
 
 			// increment difference to accumulate until stopped
@@ -101,6 +113,9 @@ func (app *App) Init() {
 					app.state.timeAccum += timeDiff
 					app.state.stepsAccum += stepsDiff
 					app.state.kmAccum += kmDiff
+					app.state.timeAccumTotal += timeDiff
+					app.state.stepsAccumTotal += stepsDiff
+					app.state.kmAccumTotal += kmDiff
 				}
 			}
 		} else {
@@ -127,7 +142,7 @@ func (app *App) setupUI() {
 			select {
 			case <-app.mStartPause.ClickedCh:
 				if !app.state.started {
-					app.state.started = true
+					app.onBeltStart()
 
 					if app.state.status.Mode == WalkingPadModeStandby {
 						app.pad.ChangeMode(WalkingPadModeManual)
@@ -136,19 +151,22 @@ func (app *App) setupUI() {
 					app.pad.WaitCmd(2500 * time.Millisecond)
 					app.pad.ChangeSpeed(app.TargetSpeed)
 				} else {
-					app.state.started = false
-
 					app.pad.StopBelt()
+					app.onBeltStop()
 				}
 			case <-app.mStop.ClickedCh:
 				if app.state.started {
-					app.state.started = false
 					app.pad.StopBelt()
+					app.onBeltStop()
 				}
 
+				app.state.startedAt = time.Time{}
 				app.state.timeAccum = 0
 				app.state.stepsAccum = 0
 				app.state.kmAccum = 0
+				app.state.timeAccumTotal = 0
+				app.state.stepsAccumTotal = 0
+				app.state.kmAccumTotal = 0
 			}
 
 			app.updateUI()
@@ -225,9 +243,9 @@ func (app *App) updateUI() {
 	case connectionStateReady:
 		systray.SetTitle(fmt.Sprintf(
 			"WP: %s - %.2f km (~%d steps) @ [%.1f km/h]",
-			app.state.timeAccum,
-			app.state.kmAccum,
-			app.state.stepsAccum,
+			app.state.timeAccumTotal,
+			app.state.kmAccumTotal,
+			app.state.stepsAccumTotal,
 			app.state.status.Speed,
 		))
 	}
@@ -239,7 +257,7 @@ func (app *App) updateUI() {
 		app.mStartPause.SetTitle("Pause")
 		app.mStop.Enable()
 	}
-	if !app.state.started && app.state.timeAccum != 0 {
+	if !app.state.started && app.state.timeAccumTotal != 0 {
 		app.mStop.Enable()
 	}
 
@@ -317,6 +335,132 @@ func (app *App) attemptToConnect() error {
 	app.state.connState = connectionStateConnected
 	app.pad = pad
 	app.updateUI()
+
+	return nil
+}
+
+func (app *App) onBeltStart() {
+	app.state.started = true
+	app.state.startedAt = time.Now()
+}
+
+func (app *App) onBeltStop() {
+	app.state.started = false
+
+	sentWebhook, err := app.sendWebhook()
+	if err != nil {
+		slog.Error("sendWebhook", "err", err)
+	}
+
+	if sentWebhook {
+		// only reset if the webhook was sent - otherwise keep the data for the next attempt
+		app.state.startedAt = time.Time{}
+		app.state.timeAccum = 0
+		app.state.stepsAccum = 0
+		app.state.kmAccum = 0
+	}
+}
+
+func (app *App) sendWebhook() (sent bool, err error) {
+	if app.WebhookURL == nil {
+		return false, nil
+	}
+	if time.Since(app.state.startedAt) < app.WebhookThreshold {
+		slog.Info("skip webhook: session length too short")
+		return false, nil
+	}
+
+	reqURL := *app.WebhookURL
+	reqURL = strings.NewReplacer(
+		"{start_ts}", url.QueryEscape(app.state.startedAt.Format(time.RFC3339)),
+		"{duration_min}", url.QueryEscape(fmt.Sprintf("%.2f", app.state.timeAccum.Minutes())),
+		"{steps}", url.QueryEscape(fmt.Sprintf("%d", app.state.stepsAccum)),
+		"{distance_km}", url.QueryEscape(fmt.Sprintf("%.2f", app.state.kmAccum)),
+	).Replace(reqURL)
+
+	var statusCode int
+	defer func() {
+		var errStr string
+		if err != nil {
+			errStr = err.Error()
+		}
+
+		line := webhookLogLine{
+			Timestamp:   time.Now(),
+			URL:         reqURL,
+			Status:      statusCode,
+			Err:         errStr,
+			StartAt:     app.state.startedAt,
+			DurationMin: app.state.timeAccum.Minutes(),
+			Steps:       app.state.stepsAccum,
+			DistanceKm:  app.state.kmAccum,
+		}
+		err = logWebhook(line)
+		if err != nil {
+			slog.Error("logWebhook", "err", err)
+		}
+	}()
+
+	slog.Info("send webhook", "url", reqURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return false, fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("send request: %w", err)
+	}
+	statusCode = resp.StatusCode
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	return true, nil
+}
+
+type webhookLogLine struct {
+	Timestamp   time.Time `json:"timestamp"`
+	URL         string    `json:"url"`
+	Status      int       `json:"status"`
+	Err         string    `json:"err,omitempty"`
+	StartAt     time.Time `json:"start_ts"`
+	DurationMin float64   `json:"duration_min"`
+	Steps       int       `json:"steps"`
+	DistanceKm  float64   `json:"distance_km"`
+}
+
+func logWebhook(line webhookLogLine) error {
+	logLine, err := json.Marshal(line)
+	if err != nil {
+		return fmt.Errorf("failed to marshal log line: %w", err)
+	}
+
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return fmt.Errorf("failed to get user config dir: %w", err)
+	}
+
+	configPath := filepath.Join(configDir, "walkingpad_webhooks.jsonl")
+
+	logFile, err := os.OpenFile(configPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %w", err)
+	}
+	defer func() { _ = logFile.Close() }()
+
+	_, err = logFile.WriteString(string(logLine) + "\n")
+	if err != nil {
+		return fmt.Errorf("failed to write to log file: %w", err)
+	}
 
 	return nil
 }
