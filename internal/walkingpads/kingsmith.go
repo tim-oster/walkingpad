@@ -197,6 +197,18 @@ func (pad *KingsmithPad) onBufferReceive(buf []byte) {
 		status := readKingsmithStatusBuffer(buf[2:])
 		pad.LastStatus = status
 		pad.LastStatusTime = time.Now()
+
+		msg := internal.UpadteStats{
+			Speed:    status.Speed,
+			Time:     status.Time,
+			WalkedKM: status.WalkedKM,
+			Steps:    status.Steps,
+		}
+		select {
+		case pad.updateChan <- msg:
+		default:
+		}
+
 		return
 	}
 }
