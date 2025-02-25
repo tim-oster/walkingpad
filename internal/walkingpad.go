@@ -31,25 +31,30 @@ type WalkingpadUpdate interface {
 	isWalkingpadUpdate()
 }
 
-type UpadteStats struct {
+type UpdateStats struct {
 	WalkingpadUpdate
 
-	Speed    float64
-	Time     time.Duration
-	WalkedKM float64
-	Steps    int
+	Timestamp time.Time
+	Speed     float64
+	Time      time.Duration
+	WalkedKM  float64
+	Steps     int
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 
 type WalkingpadCandidate struct {
-	Device  bluetooth.ScanResult
-	Connect func(adapter *bluetooth.Adapter, candidate WalkingpadCandidate) (<-chan WalkingpadUpdate, chan<- WalkingpadCommand, error)
+	Device    bluetooth.ScanResult
+	ConnectFn func(adapter *bluetooth.Adapter, candidate WalkingpadCandidate) (<-chan WalkingpadUpdate, chan<- WalkingpadCommand, error)
 }
 
-var WalkingpadDiscoverer []func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) (WalkingpadCandidate, bool)
+func (candidate WalkingpadCandidate) Connect(adapter *bluetooth.Adapter) (<-chan WalkingpadUpdate, chan<- WalkingpadCommand, error) {
+	return candidate.ConnectFn(adapter, candidate)
+}
 
-func DiscoverWalkingpadCandidates(adapter *bluetooth.Adapter, timeout time.Duration, targetAddr *string) ([]WalkingpadCandidate, error) {
+type WalkingpadDiscovererFn func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) (WalkingpadCandidate, bool)
+
+func DiscoverWalkingpadCandidates(adapter *bluetooth.Adapter, timeout time.Duration, discoverFns []WalkingpadDiscovererFn, targetAddr *string) ([]WalkingpadCandidate, error) {
 	go func() {
 		<-time.After(timeout)
 		_ = adapter.StopScan()
@@ -60,7 +65,7 @@ func DiscoverWalkingpadCandidates(adapter *bluetooth.Adapter, timeout time.Durat
 		candidates []WalkingpadCandidate
 	)
 	err := adapter.Scan(func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) {
-		for _, d := range WalkingpadDiscoverer {
+		for _, d := range discoverFns {
 			if _, ok := set[device.Address.String()]; ok {
 				return
 			}

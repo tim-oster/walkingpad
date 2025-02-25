@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -15,11 +15,8 @@ import (
 	"time"
 
 	"github.com/getlantern/systray"
+	"github.com/tim-oster/walkingpad/internal"
 	"tinygo.org/x/bluetooth"
-)
-
-const (
-	GitHubURL = "https://github.com/tim-oster/walkingpad"
 )
 
 type connectionState byte
@@ -32,10 +29,9 @@ const (
 	connectionStateReady
 )
 
-type speedItem struct {
-	speed float64
-	item  *systray.MenuItem
-}
+const (
+	GitHubURL = "https://github.com/tim-oster/walkingpad"
+)
 
 type App struct {
 	Adapter          *bluetooth.Adapter
@@ -44,7 +40,9 @@ type App struct {
 	WebhookURL       *string
 	WebhookThreshold time.Duration
 
-	pad   *WalkingPad
+	DiscoverFns []internal.WalkingpadDiscovererFn
+
+	pad   *Walkingpad
 	state state
 
 	mStartPause *systray.MenuItem
@@ -55,13 +53,19 @@ type App struct {
 type state struct {
 	connState connectionState
 	started   bool
-	status    WalkingPadStatus
+
+	status internal.UpdateStats
 
 	startedAt time.Time
 
 	timeAccum, timeAccumTotal   time.Duration
 	stepsAccum, stepsAccumTotal int
 	kmAccum, kmAccumTotal       float64
+}
+
+type speedItem struct {
+	speed float64
+	item  *systray.MenuItem
 }
 
 func (app *App) Init() {
@@ -74,6 +78,7 @@ func (app *App) Init() {
 	}
 	app.Adapter.SetConnectHandler(app.onConnectionStateChange)
 
+	// main loop - blocking
 	for {
 		if app.state.connState == connectionStateDisconnected {
 			err := app.attemptToConnect()
@@ -87,13 +92,13 @@ func (app *App) Init() {
 			}
 		}
 
-		if app.state.connState == connectionStateConnected && !app.pad.LastStatusTime.IsZero() {
+		if app.state.connState == connectionStateConnected && !app.pad.GetStats().Timestamp.IsZero() {
 			app.state.connState = connectionStateReady
 		}
 
 		if app.state.connState == connectionStateReady {
 			lastStatus := app.state.status
-			app.state.status = app.pad.LastStatus
+			app.state.status = app.pad.GetStats()
 
 			// sync external changes
 			tempoDiff := app.state.status.Speed - lastStatus.Speed
@@ -120,7 +125,7 @@ func (app *App) Init() {
 			}
 		} else {
 			app.state.started = false
-			app.state.status = WalkingPadStatus{}
+			app.state.status = internal.UpdateStats{}
 		}
 
 		app.updateUI()
@@ -143,20 +148,14 @@ func (app *App) setupUI() {
 			case <-app.mStartPause.ClickedCh:
 				if !app.state.started {
 					app.onBeltStart()
-
-					if app.state.status.Mode == WalkingPadModeStandby {
-						app.pad.ChangeMode(WalkingPadModeManual)
-					}
-					app.pad.StartBelt()
-					app.pad.WaitCmd(2500 * time.Millisecond)
-					app.pad.ChangeSpeed(app.TargetSpeed)
+					app.pad.Send(&internal.CmdStart{Speed: app.TargetSpeed})
 				} else {
-					app.pad.StopBelt()
+					app.pad.Send(&internal.CmdStop{})
 					app.onBeltStop()
 				}
 			case <-app.mStop.ClickedCh:
 				if app.state.started {
-					app.pad.StopBelt()
+					app.pad.Send(&internal.CmdStop{})
 					app.onBeltStop()
 				}
 
@@ -204,7 +203,7 @@ func (app *App) setupUI() {
 				app.updateUI()
 
 				if app.state.connState == connectionStateReady && app.state.started {
-					app.pad.ChangeSpeed(selectedSpeed)
+					app.pad.Send(&internal.CmdChangeSpeed{Speed: selectedSpeed})
 				}
 			}
 		}
@@ -277,26 +276,34 @@ func (app *App) updateUI() {
 }
 
 func (app *App) onConnectionStateChange(device bluetooth.Device, connected bool) {
-	if app.pad != nil && device.Address == app.pad.device.Address && !connected {
+	if app.pad != nil && device.Address.String() == app.pad.addr && !connected {
 		app.disconnectConnectedPad()
 	}
 }
 
 func (app *App) disconnectConnectedPad() {
 	if app.pad != nil {
-		slog.Info("disconnect walking pad", "device", app.pad.device.Address.String())
+		slog.Info("disconnect walking pad", "device", app.pad.addr)
 
 		app.pad.Disconnect()
-		app.state.connState = connectionStateDisconnected
 		app.pad = nil
-		app.updateUI()
 	}
+
+	app.state.connState = connectionStateDisconnected
+	app.updateUI()
 }
 
 func (app *App) attemptToConnect() error {
 	if app.pad != nil {
 		app.disconnectConnectedPad()
 	}
+
+	// ensure that state is reset in case of errors
+	defer func() {
+		if app.state.connState != connectionStateConnected {
+			app.state.connState = connectionStateDisconnected
+		}
+	}()
 
 	slog.Info("start scan")
 	app.state.connState = connectionStateScanning
@@ -306,7 +313,7 @@ func (app *App) attemptToConnect() error {
 	if app.PreferredDevice != "" {
 		preferredDevice = &app.PreferredDevice
 	}
-	devices, err := FindWalkingPadCandidates(app.Adapter, 5*time.Second, preferredDevice)
+	devices, err := internal.DiscoverWalkingpadCandidates(app.Adapter, 5*time.Second, app.DiscoverFns, preferredDevice)
 	if err != nil {
 		return fmt.Errorf("find walking pad candidates: %w", err)
 	}
@@ -326,14 +333,13 @@ func (app *App) attemptToConnect() error {
 	app.state.connState = connectionStateConnecting
 	app.updateUI()
 
-	pad, err := devices[0].Connect(app.Adapter, bluetooth.ConnectionParams{})
+	app.pad, err = NewWalkingpadFromCandidate(app.Adapter, devices[0])
 	if err != nil {
 		return fmt.Errorf("connect walking pad: %w", err)
 	}
 
-	slog.Info("connected to walking pad", "device", pad.device.Address.String())
+	slog.Info("connected to walking pad", "device", app.pad.addr)
 	app.state.connState = connectionStateConnected
-	app.pad = pad
 	app.updateUI()
 
 	return nil

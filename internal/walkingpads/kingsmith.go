@@ -1,4 +1,4 @@
-package main
+package walkingpads
 
 import (
 	"context"
@@ -48,77 +48,75 @@ func sleepCtx(ctx context.Context, timeout time.Duration) {
 	}
 }
 
-func init() {
-	internal.WalkingpadDiscoverer = append(internal.WalkingpadDiscoverer, func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) (internal.WalkingpadCandidate, bool) {
-		for _, uuid := range kingsmithUUIDs {
-			if device.HasServiceUUID(uuid) {
-				return internal.WalkingpadCandidate{
-					Device: device,
-					Connect: func(adapter *bluetooth.Adapter, candidate internal.WalkingpadCandidate) (<-chan internal.WalkingpadUpdate, chan<- internal.WalkingpadCommand, error) {
-						device, err := adapter.Connect(candidate.Device.Address, bluetooth.ConnectionParams{})
+var KingsmithDiscoverFn = func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) (internal.WalkingpadCandidate, bool) {
+	for _, uuid := range kingsmithUUIDs {
+		if device.HasServiceUUID(uuid) {
+			return internal.WalkingpadCandidate{
+				Device: device,
+				ConnectFn: func(adapter *bluetooth.Adapter, candidate internal.WalkingpadCandidate) (<-chan internal.WalkingpadUpdate, chan<- internal.WalkingpadCommand, error) {
+					device, err := adapter.Connect(candidate.Device.Address, bluetooth.ConnectionParams{})
+					if err != nil {
+						return nil, nil, fmt.Errorf("connect: %w", err)
+					}
+
+					services, err := device.DiscoverServices(nil)
+					if err != nil {
+						return nil, nil, fmt.Errorf("discover services: %w", err)
+					}
+
+					var (
+						rxFound, txFound bool
+						rx               bluetooth.DeviceCharacteristic
+						tx               bluetooth.DeviceCharacteristic
+					)
+					for _, service := range services {
+						characteristics, err := service.DiscoverCharacteristics(nil)
 						if err != nil {
-							return nil, nil, fmt.Errorf("connect: %w", err)
+							return nil, nil, fmt.Errorf("discover characteristics: %w", err)
 						}
 
-						services, err := device.DiscoverServices(nil)
-						if err != nil {
-							return nil, nil, fmt.Errorf("discover services: %w", err)
-						}
-
-						var (
-							rxFound, txFound bool
-							rx               bluetooth.DeviceCharacteristic
-							tx               bluetooth.DeviceCharacteristic
-						)
-						for _, service := range services {
-							characteristics, err := service.DiscoverCharacteristics(nil)
-							if err != nil {
-								return nil, nil, fmt.Errorf("discover characteristics: %w", err)
+						for _, ch := range characteristics {
+							if strings.HasPrefix(ch.UUID().String(), "0000fe01") {
+								rx = ch
+								rxFound = true
 							}
-
-							for _, ch := range characteristics {
-								if strings.HasPrefix(ch.UUID().String(), "0000fe01") {
-									rx = ch
-									rxFound = true
-								}
-								if strings.HasPrefix(ch.UUID().String(), "0000fe02") {
-									tx = ch
-									txFound = true
-								}
+							if strings.HasPrefix(ch.UUID().String(), "0000fe02") {
+								tx = ch
+								txFound = true
 							}
 						}
+					}
 
-						if !rxFound || !txFound {
-							return nil, nil, fmt.Errorf("missing characteristics")
-						}
+					if !rxFound || !txFound {
+						return nil, nil, fmt.Errorf("missing characteristics")
+					}
 
-						pad := &KingsmithPad{
-							device: device,
-							rx:     rx,
-							tx:     tx,
-							// allow channels to function as queues to avoid UI blocking in case processing is slow
-							updateChan: make(chan internal.WalkingpadUpdate, 50),
-							queue:      make(chan kingsmithCommand, 50),
-						}
-						cmdChan := make(chan internal.WalkingpadCommand, 50)
+					pad := &KingsmithPad{
+						device: device,
+						rx:     rx,
+						tx:     tx,
+						// allow channels to function as queues to avoid UI blocking in case processing is slow
+						updateChan: make(chan internal.WalkingpadUpdate, 50),
+						queue:      make(chan kingsmithCommand, 50),
+					}
+					cmdChan := make(chan internal.WalkingpadCommand, 50)
 
-						_ = pad.rx.EnableNotifications(pad.onBufferReceive)
+					_ = pad.rx.EnableNotifications(pad.onBufferReceive)
 
-						var ctx context.Context
-						ctx, pad.cancel = context.WithCancel(context.Background())
+					var ctx context.Context
+					ctx, pad.cancel = context.WithCancel(context.Background())
 
-						pad.wg.Add(3)
-						go pad.processCmds(cmdChan)
-						go pad.writeLoop(ctx)
-						go pad.askStatsLoop(ctx)
+					pad.wg.Add(3)
+					go pad.processCmds(cmdChan)
+					go pad.writeLoop(ctx)
+					go pad.askStatsLoop(ctx)
 
-						return pad.updateChan, cmdChan, nil
-					},
-				}, true
-			}
+					return pad.updateChan, cmdChan, nil
+				},
+			}, true
 		}
-		return internal.WalkingpadCandidate{}, false
-	})
+	}
+	return internal.WalkingpadCandidate{}, false
 }
 
 type KingsmithPad struct {
@@ -198,11 +196,12 @@ func (pad *KingsmithPad) onBufferReceive(buf []byte) {
 		pad.LastStatus = status
 		pad.LastStatusTime = time.Now()
 
-		msg := internal.UpadteStats{
-			Speed:    status.Speed,
-			Time:     status.Time,
-			WalkedKM: status.WalkedKM,
-			Steps:    status.Steps,
+		msg := &internal.UpdateStats{
+			Timestamp: time.Now(),
+			Speed:     status.Speed,
+			Time:      status.Time,
+			WalkedKM:  status.WalkedKM,
+			Steps:     status.Steps,
 		}
 		select {
 		case pad.updateChan <- msg:

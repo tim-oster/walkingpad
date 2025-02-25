@@ -1,4 +1,4 @@
-package main
+package internal
 
 import (
 	"encoding/json"
@@ -6,38 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"time"
-
-	"github.com/getlantern/systray"
-	"tinygo.org/x/bluetooth"
 )
-
-func main() {
-	cfg, err := tryLoadConfig()
-	if err != nil {
-		slog.Error("failed to load config", "err", err)
-		cfg = &Config{
-			PreferredDevice:     "",
-			TargetSpeed:         2.5,
-			WebhookURL:          nil,
-			WebhookThresholdMin: nil,
-		}
-	}
-
-	webhookThreshold := 5 * time.Minute
-	if cfg.WebhookThresholdMin != nil {
-		webhookThreshold = time.Duration(*cfg.WebhookThresholdMin*60.0) * time.Second
-	}
-
-	app := &App{
-		Adapter:          bluetooth.DefaultAdapter,
-		PreferredDevice:  cfg.PreferredDevice,
-		TargetSpeed:      cfg.TargetSpeed,
-		WebhookURL:       cfg.WebhookURL,
-		WebhookThreshold: webhookThreshold,
-	}
-	systray.Run(app.Init, app.Close)
-}
 
 type Config struct {
 	PreferredDevice     string   `json:"preferredDevice"`
@@ -46,7 +15,16 @@ type Config struct {
 	WebhookThresholdMin *float64 `json:"webhookThresholdMin"`
 }
 
-func tryLoadConfig() (*Config, error) {
+func NewDefaultConfig() *Config {
+	return &Config{
+		PreferredDevice:     "",
+		TargetSpeed:         2.5,
+		WebhookURL:          nil,
+		WebhookThresholdMin: nil,
+	}
+}
+
+func LoadConfigFromHome() (*Config, error) {
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user config dir: %w", err)
